@@ -10,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BUNDLE_ID="${BUNDLE_ID:-io.github.alphainfix.dsh-whale}"
-VERSION="${VERSION:-1.1}"
+VERSION="${VERSION:-1.1.1}"
 APP=build/DSHWhale.app
 
 swift build -c release

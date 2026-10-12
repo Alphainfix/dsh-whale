@@ -131,15 +131,78 @@ func currentWebURL() -> URL {
 /// 0.1.5 之后点开只会看到一行 401 文本,表现就是「打不开」。所以这里显式把带
 /// token 的地址交给它;万一它拒绝接 URL(只是把窗口拉到前面),退回默认浏览器,
 /// 至少能进去,而且 cookie 一换就是 30 天,后面裸地址也能用。
+///
+/// 2026-10-12 又「打不开」了一次,原因不同:网页 App 的窗口关掉之后进程并不退出
+/// (macOS 的惯例),而一个没有窗口的实例收到「打开这个地址」只会被激活、不会新开
+/// 窗口 —— 点了没反应。那次的进程从 10-08 起挂在后台,窗口列表里只剩几条 33 像素
+/// 高的标题栏。所以打开之后看一眼:4 秒内没有像样的窗口,就把这个实例关掉重开一次;
+/// 还是没有,再退回默认浏览器。
 func openDSHWebApp() {
     let app = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Applications/DSH.app")
-    let url = currentWebURL()
-    NSWorkspace.shared.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration()) { _, err in
-        guard err != nil else { return }
-        NSLog("DSHWhale: DSH.app 打不开带 token 的地址(\(err!.localizedDescription)),改用默认浏览器")
-        NSWorkspace.shared.open(url)
+    openWebApp(app, currentWebURL(), retry: true)
+}
+
+private func openWebApp(_ app: URL, _ url: URL, retry: Bool) {
+    NSWorkspace.shared.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration()) { running, err in
+        if let err {
+            NSLog("DSHWhale: DSH.app 打不开带 token 的地址(\(err.localizedDescription)),改用默认浏览器")
+            NSWorkspace.shared.open(url)
+            return
+        }
+        guard let running else { return }
+        waitForContentWindow(pid: running.processIdentifier) { shown in
+            if shown { return }
+            guard retry else {
+                NSLog("DSHWhale: 重开之后 DSH.app 还是没有窗口,改用默认浏览器")
+                NSWorkspace.shared.open(url)
+                return
+            }
+            NSLog("DSHWhale: DSH.app 在跑但没有窗口(窗口关了、进程还在),关掉重开")
+            running.terminate()
+            waitUntilTerminated(running) { openWebApp(app, url, retry: false) }
+        }
     }
+}
+
+/// 这个进程有没有一个在屏幕上的内容窗口。网页 App 一直挂着几条 33 像素高的
+/// 标题栏窗口,所以按高度挑;激活时会切到窗口所在的桌面,别的桌面上的窗口也算数。
+func hasContentWindow(pid: pid_t) -> Bool {
+    let windows = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        as? [[String: Any]]) ?? []
+    return windows.contains { w in
+        guard (w[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) == pid,
+              (w[kCGWindowLayer as String] as? Int) == 0,
+              let bounds = w[kCGWindowBounds as String] as? NSDictionary,
+              let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return false }
+        return rect.height >= 200
+    }
+}
+
+/// 最多等 `timeout` 秒,每半秒看一次窗口出来没有(冷启动要一两秒)。
+func waitForContentWindow(pid: pid_t, timeout: TimeInterval = 4, done: @escaping (Bool) -> Void) {
+    let deadline = Date().addingTimeInterval(timeout)
+    func poll() {
+        if hasContentWindow(pid: pid) { return done(true) }
+        if Date() >= deadline { return done(false) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: poll)
+    }
+    DispatchQueue.main.async(execute: poll)
+}
+
+/// 等它真的退出(最多 3 秒,不退就强制),再接着做。
+func waitUntilTerminated(_ app: NSRunningApplication, done: @escaping () -> Void) {
+    let deadline = Date().addingTimeInterval(3)
+    func poll() {
+        if app.isTerminated { return done() }
+        if Date() >= deadline {
+            app.forceTerminate()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: done)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: poll)
+    }
+    DispatchQueue.main.async(execute: poll)
 }
 
 final class DSHProcessManager {
