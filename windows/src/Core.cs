@@ -208,8 +208,14 @@ namespace DshWhale {
             public uint RemoteScope, RemotePort, State, Pid;
         }
         [DllImport("iphlpapi.dll")] static extern uint GetExtendedTcpTable(IntPtr table, ref int size, bool order, int family, int tableClass, uint reserved);
+        // Processes serving 127.0.0.1/::1 on this port: bound to loopback or to every address. A listener on one
+        // other address does not count; `tailscale serve` on Windows holds the same port on the tailnet address.
         public static List<int> Listeners(int port) {
             return ListenersFamily(port, 2).Concat(ListenersFamily(port, 23)).Distinct().ToList();
+        }
+        static bool ServesLoopback6(byte[] address) {
+            for (int i = 0; i < 15; i++) if (address[i] != 0) return false;
+            return address[15] == 0 || address[15] == 1;
         }
         static List<int> ListenersFamily(int port, int family) {
             int size = 0; GetExtendedTcpTable(IntPtr.Zero, ref size, false, family, 3, 0);
@@ -221,11 +227,12 @@ namespace DshWhale {
                 int count = Marshal.ReadInt32(memory); var result = new List<int>();
                 int stride = Marshal.SizeOf(family == 2 ? typeof(TcpRow) : typeof(Tcp6Row));
                 for (int i = 0; i < count; i++) {
-                    uint rawPort, pid;
-                    if (family == 2) { var row = (TcpRow)Marshal.PtrToStructure(IntPtr.Add(memory, 4 + i * stride), typeof(TcpRow)); rawPort = row.LocalPort; pid = row.Pid; }
-                    else { var row = (Tcp6Row)Marshal.PtrToStructure(IntPtr.Add(memory, 4 + i * stride), typeof(Tcp6Row)); rawPort = row.LocalPort; pid = row.Pid; }
+                    uint rawPort, pid; bool loopback;
+                    // The IPv4 address is in network order, so its first byte is the low byte: 0.0.0.0 or 127.x.x.x.
+                    if (family == 2) { var row = (TcpRow)Marshal.PtrToStructure(IntPtr.Add(memory, 4 + i * stride), typeof(TcpRow)); rawPort = row.LocalPort; pid = row.Pid; loopback = row.LocalAddress == 0 || (row.LocalAddress & 255) == 127; }
+                    else { var row = (Tcp6Row)Marshal.PtrToStructure(IntPtr.Add(memory, 4 + i * stride), typeof(Tcp6Row)); rawPort = row.LocalPort; pid = row.Pid; loopback = ServesLoopback6(row.LocalAddress); }
                     int p = (int)(((rawPort & 255) << 8) | ((rawPort >> 8) & 255));
-                    if (p == port) result.Add((int)pid);
+                    if (p == port && loopback) result.Add((int)pid);
                 }
                 return result.Distinct().ToList();
             } finally { Marshal.FreeHGlobal(memory); }

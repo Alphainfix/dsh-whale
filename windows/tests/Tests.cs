@@ -53,6 +53,10 @@ class Tests {
             Check(service.WebUrl().Contains("?token=fixture-"), "latest login token extracted");
             Check(Native.Listeners(port).Count == 1, "Windows listener PID discovery");
             int first = Native.Listeners(port).Single();
+            // Like tailscale serve on Windows: the same port held on another address of this machine is not DSH.
+            var lan = Dns.GetHostAddresses(Dns.GetHostName()).FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(a));
+            if (lan == null) Console.WriteLine("SKIP: listener on another address (this host has no non-loopback IPv4 address)");
+            else { var other = new TcpListener(lan, port); other.Start(); try { Check(Native.Listeners(port).Count == 1 && Native.Listeners(port).Single() == first, "a listener on another address does not count as DSH"); } finally { other.Stop(); } }
             await service.Start(false); Check(Native.Listeners(port).Single() == first, "duplicate start reuses existing process");
             await service.Restart(); Check(Native.Listeners(port).Single() != first && service.Running, "restart waits for port release and starts new PID");
             await service.Stop(); Check(Native.Listeners(port).Count == 0, "stop releases port");
