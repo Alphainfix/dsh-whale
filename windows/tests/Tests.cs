@@ -1,0 +1,111 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading.Tasks;
+using DshWhale;
+
+class Tests {
+    static int checks;
+    static void Check(bool condition, string name) { if (!condition) throw new Exception("FAIL: " + name); checks++; Console.WriteLine("PASS: " + name); }
+    static int FreePort() { var t = new TcpListener(IPAddress.Loopback, 0); t.Start(); int p = ((IPEndPoint)t.LocalEndpoint).Port; t.Stop(); return p; }
+    static int Main(string[] args) {
+        // The tests' own folders stand in for the user's: a DSH_HOME on this machine must not steer them.
+        Environment.SetEnvironmentVariable("DSH_HOME", null);
+        try { Run(args[0]).GetAwaiter().GetResult(); Console.WriteLine("Passed " + checks + " checks"); return 0; } catch (Exception e) { Console.Error.WriteLine(e); return 1; }
+    }
+    static async Task Run(string root) {
+        var data = Balances.Parse("{\"ok\":true,\"providers\":{\"usd\":{\"ok\":true,\"label\":\"USD\",\"currency\":\"USD\",\"remaining\":3},\"quota\":{\"ok\":true,\"label\":\"Quota\",\"kind\":\"quota\",\"currency\":\"%\",\"remaining\":9.95,\"limit\":10},\"fail\":{\"ok\":false}}}");
+        Check(data["usd"].Health == "green" && data["usd"].Text == "$3.00", "USD color uses CNY conversion");
+        Check(data["quota"].Health == "green", "quota health uses fraction, not absolute value");
+        Check(data["fail"].Text == "—", "provider error has unavailable value");
+        var saved = new List<SourceSetting> { new SourceSetting { Id = "missing", Title = "自定义", Visible = true } };
+        var layout = Balances.Layout(saved, data);
+        Check(layout[0].Id == "missing" && layout.Skip(1).All(x => !x.Visible), "saved ordering retained and new providers hidden");
+        Check(Balances.Layout(null, data).All(x => x.Visible), "first-run providers visible");
+        // Panel placement on a 3840x2160 screen; the panel is 576x700 and keeps 24 px from every edge.
+        var screen = new Rectangle(0, 0, 3840, 2160); var panel = new Size(576, 700);
+        var bottomBar = new Rectangle(0, 0, 3840, 2064);
+        Check(Placement.Compute(new Rectangle(3200, 2080, 32, 32), screen, bottomBar, panel, 24) == new Point(3216 - 288, 2064 - 24 - 700), "panel opens above the taskbar, centred on the tray icon");
+        Check(Placement.Compute(new Rectangle(3790, 2080, 32, 32), screen, bottomBar, panel, 24).X == 3840 - 24 - 576, "panel stays on screen when the icon is at the edge");
+        Check(Placement.Compute(new Rectangle(3200, 10, 32, 32), screen, new Rectangle(0, 96, 3840, 2064), panel, 24).Y == 96 + 24, "top taskbar puts the panel below it");
+        Check(Placement.Compute(new Rectangle(10, 1000, 32, 32), screen, new Rectangle(96, 0, 3744, 2160), panel, 24).X == 96 + 24, "left taskbar puts the panel beside it");
+        Check(Placement.Compute(new Rectangle(3200, 2140, 32, 20), screen, screen, panel, 24).Y == 2140 - 24 - 700, "auto-hidden taskbar: the panel opens above the icon");
+        string directory = Path.Combine(root, "build", "test-data-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(directory);
+        string fixture = Path.Combine(directory, "fixture with spaces.js"); File.Copy(Path.Combine(root, "tests", "fake-dsh.js"), fixture);
+        var settings = new Settings { NodePath = Discovery.FindExe("node.exe"), DshPath = fixture, Sources = saved };
+        settings.Save(Path.Combine(directory, "settings.json"));
+        Check(Settings.Load(Path.Combine(directory, "settings.json")).Sources[0].Title == "自定义", "settings UTF-8 roundtrip");
+        File.WriteAllText(Path.Combine(directory, "old-settings.json"), "{\"ShowClawbot\":false}");
+        var older = Settings.Load(Path.Combine(directory, "old-settings.json"));
+        Check(!older.ShowClawbot && older.HostMode == "auto", "settings from an older build get defaults for what they lack");
+        int port = FreePort(); File.WriteAllText(Path.Combine(directory, "port.txt"), port.ToString());
+        var service = new Service(settings, directory, port);
+        try {
+            await service.Start(false);
+            Check(service.Running, "native launch and HTTP 401 counts as running");
+            Check(service.Readings.ContainsKey("deepseek"), "balance API read without login (dsh-balance-sidebar contract)");
+            Check(service.Readings["kimi"].Error == "Kimi 用量接口超时" && service.Readings["kimi"].Text == "—", "failure text read from the message field");
+            Check(service.WebUrl().Contains("?token=fixture-"), "latest login token extracted");
+            Check(Native.Listeners(port).Count == 1, "Windows listener PID discovery");
+            int first = Native.Listeners(port).Single();
+            // Like tailscale serve on Windows: the same port held on another address of this machine is not DSH.
+            var lan = Dns.GetHostAddresses(Dns.GetHostName()).FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(a));
+            if (lan == null) Console.WriteLine("SKIP: listener on another address (this host has no non-loopback IPv4 address)");
+            else { var other = new TcpListener(lan, port); other.Start(); try { Check(Native.Listeners(port).Count == 1 && Native.Listeners(port).Single() == first, "a listener on another address does not count as DSH"); } finally { other.Stop(); } }
+            await service.Start(false); Check(Native.Listeners(port).Single() == first, "duplicate start reuses existing process");
+            await service.Restart(); Check(Native.Listeners(port).Single() != first && service.Running, "restart waits for port release and starts new PID");
+            await service.Stop(); Check(Native.Listeners(port).Count == 0, "stop releases port");
+            Check(File.Exists(Path.Combine(directory, "graceful-stop.txt")), "Windows console signal allows graceful SIGINT cleanup");
+            await service.Tick(true); Check(Native.Listeners(port).Count == 0, "manual stop suppresses watchdog");
+            settings.FullAccess = true; await service.Start(false);
+            Check(File.ReadAllText(Path.Combine(directory, "environment.json")).Contains("danger-full-access"), "explicit full-access environment injected");
+            await service.Stop(); settings.FullAccess = false;
+            Environment.SetEnvironmentVariable("DSH_PERMISSION_MODE", "danger-full-access");
+            await service.Start(false);
+            Check(!File.ReadAllText(Path.Combine(directory, "environment.json")).Contains("danger-full-access"), "default removes inherited full-access override");
+            Environment.SetEnvironmentVariable("DSH_PERMISSION_MODE", null);
+            first = Native.Listeners(port).Single(); Process.GetProcessById(first).Kill(); await Task.Delay(300);
+            await service.Tick(true); Check(service.Running && Native.Listeners(port).Single() != first, "watchdog restores crashed service");
+            await service.Stop(); File.WriteAllText(Path.Combine(directory, "fail.txt"), "1");
+            await service.Start(false); await service.Tick(true); await service.Tick(true);
+            Check(service.Failures == 3, "three startup failures trip circuit breaker");
+            await service.Tick(true); Check(service.Failures == 3 && !service.Running, "watchdog stops retrying after three failures");
+            File.Delete(Path.Combine(directory, "fail.txt")); await service.Start(false); Check(service.Failures == 0 && service.Running, "manual start resets failure counter");
+            service.Dispose();
+            await Task.Delay(300); Check(Native.Listeners(port).Count == 1, "service survives disposing companion handles");
+            service = new Service(settings, directory, port); await service.Tick(false); Check(service.Running, "adopts externally running service");
+            await service.Stop(); Check(Native.Listeners(port).Count == 0, "verified external service can be stopped");
+            var listener = new TcpListener(IPAddress.Loopback, port); listener.Start();
+            bool blocked = false; try { await service.Stop(); } catch (InvalidOperationException) { blocked = true; } finally { listener.Stop(); }
+            Check(blocked, "unrelated port owner is never terminated");
+            var occupied = new TcpListener(IPAddress.Loopback, port); occupied.Start();
+            var fresh = new Service(settings, directory, port); bool threw = false;
+            try { await fresh.Restart(); } catch (InvalidOperationException) { threw = true; } finally { occupied.Stop(); fresh.Dispose(); }
+            Check(threw && !fresh.Stopped, "failed restart leaves the watchdog on");
+        } finally { try { service.Stop().GetAwaiter().GetResult(); } catch { } service.Dispose(); }
+        string desktopHome = Path.Combine(directory, "desktop-only"); Directory.CreateDirectory(Path.Combine(desktopHome, ".dsh", "profiles", "desktop"));
+        int idle = FreePort(); var observer = new Service(new Settings(), desktopHome, idle);
+        try {
+            Check(observer.DesktopOnly && !observer.Manages, "a DSH Desktop-only home is observed, not managed");
+            await observer.Tick(true); Check(Native.Listeners(idle).Count == 0 && !observer.Running, "watchdog never starts dsh web next to DSH Desktop");
+            Directory.CreateDirectory(Path.Combine(desktopHome, ".dsh", "profiles", "web")); Check(observer.Manages, "a web profile beside it is managed again");
+            observer.Settings.HostMode = "observe"; Check(!observer.Manages, "observe mode never manages");
+            Directory.Delete(Path.Combine(desktopHome, ".dsh", "profiles", "web")); observer.Settings.HostMode = "manage"; Check(observer.Manages, "manage mode overrides the Desktop detection");
+        } finally { observer.Dispose(); }
+        string externalHome = Path.Combine(directory, "independent"); Directory.CreateDirectory(externalHome); File.WriteAllText(Path.Combine(externalHome, "port.txt"), port.ToString());
+        string host = Path.Combine(root, "build", "TestLauncher.exe");
+        using (var parent = Process.Start(new ProcessStartInfo(host, Native.Quote(settings.NodePath) + " " + Native.Quote(fixture) + " " + Native.Quote(externalHome)) { UseShellExecute = false, CreateNoWindow = true })) await Task.Run(() => parent.WaitForExit());
+        for (int i = 0; i < 20 && Native.Listeners(port).Count == 0; i++) await Task.Delay(100);
+        Check(Native.Listeners(port).Count == 1, "child keeps running after actual launcher process exits");
+        var adopted = new Service(settings, externalHome, port); try { await adopted.Stop(); } finally { adopted.Dispose(); }
+        try { var found = Discovery.Find(new Settings()); Check(File.Exists(found.Entry), "installed DSH discovered from npm cache"); }
+        catch (FileNotFoundException) { if(Environment.GetEnvironmentVariable("WHALE_TEST_REQUIRE_DSH")=="1")throw; Console.WriteLine("SKIP: optional installed DSH discovery (no installation on this host)"); }
+        var live = new Service(new Settings(), Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 3080);
+        try { await live.Tick(false); Console.WriteLine("READ-ONLY local DSH: running=" + live.Running + ", balanceProviders=" + live.Readings.Count); } finally { live.Dispose(); }
+    }
+}

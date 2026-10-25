@@ -297,7 +297,13 @@ final class DSHProcessManager {
             "/usr/local/bin/dsh",
             "\(home)/.npm-global/bin/dsh",
         ]
-        for path in fixed where fm.isExecutableFile(atPath: path) { return path }
+        // DSH Desktop's command (its 「管理 dsh 命令…」) links /usr/local/bin/dsh to a shell launcher
+        // inside the app bundle: run through node it fails, and it would start a second host beside
+        // Desktop anyway. Only an npm-installed dsh is managed here.
+        for path in fixed where fm.isExecutableFile(atPath: path) {
+            if URL(fileURLWithPath: path).resolvingSymlinksInPath().path.contains(".app/") { continue }
+            return path
+        }
 
         let npx = "\(home)/.npm/_npx"
         guard let buckets = try? fm.contentsOfDirectory(atPath: npx) else { return nil }
@@ -1068,6 +1074,11 @@ final class WhaleApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
             renderSnapshots(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
             return
         }
+        // 同一时刻只留一只(见 SingleInstance)。要在建状态栏图标、碰 dsh 之前决定。
+        guard SingleInstance.claim() else {
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+            return
+        }
         UNUserNotificationCenter.current().delegate = self
 
         statusItem = NSStatusBar.system.statusItem(withLength: 22)
@@ -1132,6 +1143,12 @@ final class WhaleApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         panel.delegate = self
         panel.setContentSize(size)
         self.panel = panel
+
+        // 又从访达、启动台打开了一份:那一份会退出,并让这一只弹出面板(或者打开设置页)。
+        DistributedNotificationCenter.default().addObserver(forName: SingleInstance.reopenNotification,
+                                                            object: nil, queue: .main) { [weak self] note in
+            if note.object as? String == "settings" { self?.openSettings() } else { self?.showPanel() }
+        }
 
         // 后台异步刷新缓存(每 20 秒 + 弹出前),绝不阻塞主线程
         refreshCache()
@@ -1311,6 +1328,13 @@ final class WhaleApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     }
 
     private func openWeb() { openDSHWebApp() }
+
+    /// 这一只是从访达、启动台打开的,再打开一次时系统不会另起一份,只会发来「重新打开」。
+    /// 这里同样弹出面板,和转交过来的情况一致。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if panel != nil { showPanel() }   // --snapshot 模式没有面板
+        return false
+    }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner, .sound])

@@ -1,0 +1,144 @@
+name: Build and package
+
+# Every push and PR builds and tests both apps. A v* tag on the original repo also attaches the
+# zips to that release. Release notes are written by hand, so this job never publishes them.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}   # Info.plist CFBundleShortVersionString
+      label: ${{ steps.v.outputs.label }}       # file names
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
+            if [[ ! "$v" =~ ^[0-9]+[.][0-9]+([.][0-9]+)?$ ]]; then
+              echo "::error::tag $GITHUB_REF_NAME is not vMAJOR.MINOR[.PATCH]"; exit 1
+            fi
+            echo "version=$v" >> "$GITHUB_OUTPUT"
+            echo "label=$v" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0" >> "$GITHUB_OUTPUT"
+            echo "label=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  mac:
+    needs: version
+    runs-on: macos-latest            # arm64; x86_64 is cross-compiled and combined with lipo
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      LABEL: ${{ needs.version.outputs.label }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Root and mac/ manifests agree
+        run: diff <(sed 's#"mac/Sources/DSHWhale"#"Sources/DSHWhale"#' Package.swift) mac/Package.swift
+      - name: Build universal app
+        env:
+          ARCHS: arm64 x86_64
+        run: bash mac/scripts/build-app.sh
+      - name: Check the app
+        run: |
+          set -euo pipefail
+          app=mac/build/DSHWhale.app
+          bin="$app/Contents/MacOS/DSHWhale"
+          archs="$(lipo -archs "$bin")"; echo "architectures: $archs"
+          [[ " $archs " == *" arm64 "* && " $archs " == *" x86_64 "* ]] || { echo "::error::not a universal binary"; exit 1; }
+          if strings -a "$bin" | grep -E '/Users/|/home/'; then echo "::error::absolute build path inside the binary"; exit 1; fi
+          codesign --verify --strict --verbose=2 "$app"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$VERSION" ]
+      - name: Zip
+        run: ditto -c -k --sequesterRsrc --keepParent mac/build/DSHWhale.app "mac/build/DSHWhale-$LABEL-macos.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: mac/build/DSHWhale-${{ needs.version.outputs.label }}-macos.zip
+          if-no-files-found: error
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      LABEL: ${{ needs.version.outputs.label }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Build and test
+        shell: powershell
+        run: ./windows/scripts/test-windows.ps1
+      - name: Package
+        shell: pwsh                    # PowerShell 7: '/' separators and UTF-8 names inside the zip
+        run: |
+          ./windows/scripts/package-windows.ps1
+          Move-Item -LiteralPath windows/dist/DSHWhale-windows.zip -Destination "windows/dist/DSHWhale-$env:LABEL-windows-x64.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: windows/dist/DSHWhale-${{ needs.version.outputs.label }}-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    # Only the original repo, only tags: the org mirror receives the same tags but never releases.
+    if: github.repository == 'Alphainfix/dsh-whale' && startsWith(github.ref, 'refs/tags/v')
+    needs: [version, mac, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Attach assets (notes are written by hand; never publish here)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -l release-assets
+          # Give the hand-made release up to 10 minutes; gh also finds drafts by their pending tag.
+          found=
+          for _ in $(seq 1 20); do
+            if gh release view "$TAG" --json isDraft >/dev/null 2>&1; then found=1; break; fi
+            sleep 30
+          done
+          if [ -n "$found" ]; then
+            gh release upload "$TAG" release-assets/*.zip --clobber
+            echo "::notice::attached assets to the existing release $TAG"
+          else
+            gh release create "$TAG" release-assets/*.zip --draft --verify-tag --title "$TAG" \
+              --notes "Built by CI. Release notes are written by hand: edit this draft, then publish it."
+            echo "::notice::created draft release $TAG"
+          fi

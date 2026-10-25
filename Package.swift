@@ -7,7 +7,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "DSHWhale",
-            path: "Sources/DSHWhale",
+            path: "mac/Sources/DSHWhale",
             resources: [
                 .copy("Resources/menubar.png"),
                 .copy("Resources/menubar@2x.png"),
