@@ -1,0 +1,57 @@
+name: Build and package
+on:
+  push:
+    branches: [main, windows-support]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build and test Windows
+        shell: powershell
+        run: ./windows/scripts/test-windows.ps1
+      - name: Test shared integrations
+        run: node --test shared/tests/balances.test.mjs
+      - name: Package Windows
+        shell: powershell
+        run: ./windows/scripts/package-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-whale-windows
+          path: windows/dist/DSHWhale-Vibe-Windows.zip
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build upstream macOS app
+        run: bash scripts/build-app.sh
+      - name: Package macOS
+        run: ditto -c -k --sequesterRsrc --keepParent mac/build/DSHWhale.app mac/build/DSHWhale-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-whale-macos
+          path: mac/build/DSHWhale-macOS.zip
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish platform archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" release-assets/*.zip --verify-tag --generate-notes
