@@ -59,4 +59,5 @@ GitHub Actions 在推到 main、开 PR、推 `v*` tag（或手动运行）时分
 
 ## License
 
-[MIT](LICENSE)，保留 Alphainfix 的原始版权与许可。Windows 版由 [genius-FXC](https://github.com/genius-FXC) 移植，蓝色鲸鱼图标是生成式图像资源。
+[MIT](LICENSE)，保留 Alphainfix 的原始版权与许可。Windows 版由 [genius-FXC](https://github.com/genius-FXC) 移植；
+Windows 图标用 Mac 版应用图标里的鲸鱼配蓝色底，移植时那只蓝色卡通鲸鱼（生成式图像资源）留作可选（`build-icon.ps1 -Classic`）。

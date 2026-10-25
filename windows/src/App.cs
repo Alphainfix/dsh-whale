@@ -1,9 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Diagnostics;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -56,24 +59,35 @@ namespace DshWhale {
             return 0;
         }
     }
+    // The tray panel. It opens against the taskbar next to the tray icon, closes on a second click, a click
+    // elsewhere or Esc, and keeps the button layout: service toggle and restart, the open button, then the footer.
     public class WhaleForm : Form {
+        class RowData { public string Title, Value, Health; public bool Emphasis; }
         readonly bool demo;
         readonly string settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DSHWhale", "settings.json");
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         Settings settings;
         Service service;
         NotifyIcon tray;
-        System.Windows.Forms.Timer timer;
-        FlowLayoutPanel rows;
-        Label updated;
-        Button toggle, restart, open, configure, quit;
-        Panel bottomLine;
-        DateTime updatedAt;
-        bool quitting, busy;
+        MenuItem openItem;
+        System.Windows.Forms.Timer timer, clock;
+        readonly List<StatusLine> rows = new List<StatusLine>();
+        readonly SoftButton toggle, restart, open, configure, quit;
+        Rectangle header, card, anchor;
+        int separator = -1;
+        bool headerHot, quitting, refreshing;
+        // The service action under way ("toggle", "restart", "open", "quit"). The 20-second refresh never sets it,
+        // so the buttons stay usable while it runs.
+        string busy;
         string startupProblem;
-        DateTime lastClose;
+        DateTime updatedAt, lastClose;
         SettingsForm settingsForm;
-        Icon whaleIcon;
+        readonly Icon trayIcon, appIcon;
+        readonly Bitmap glyph;
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+        [DllImport("shell32.dll")] static extern int Shell_NotifyIconGetRect(ref NotifyIconIdentifier identifier, out NativeRect rect);
+        [StructLayout(LayoutKind.Sequential)] struct NotifyIconIdentifier { public int Size; public IntPtr Window; public uint Id; public Guid Item; }
+        [StructLayout(LayoutKind.Sequential)] struct NativeRect { public int Left, Top, Right, Bottom; }
         public WhaleForm(bool demo) {
             this.demo = demo;
             if (!demo) MigrateSettings();
@@ -83,28 +97,28 @@ namespace DshWhale {
             // An empty WorkingDirectory starts DSH in the user folder, as the Mac app does.
             service = new Service(settings, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 3080);
             service.Notify = Notify; service.Open = OpenWeb;
-            Text = "DSH 小鲸鱼"; Font = Style.Font(13,false); BackColor = Color.White;
-            AutoScaleMode=AutoScaleMode.None; FormBorderStyle=FormBorderStyle.None; ShowInTaskbar=false; TopMost=true;
-            ClientSize=new Size(Style.P(288),Style.P(289));
-            var header=new Panel { Bounds=new Rectangle(Style.P(8),Style.P(8),Style.P(272),Style.P(30)),Cursor=Cursors.Hand };
-            header.Click+=delegate{OpenWeb();}; Controls.Add(header);
-            string glyph=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"whale.png");
-            if(File.Exists(glyph)) {var picture=new PictureBox{Image=Image.FromFile(glyph),SizeMode=PictureBoxSizeMode.Zoom,Bounds=new Rectangle(Style.P(6),Style.P(5),Style.P(19),Style.P(19))};picture.Click+=delegate{OpenWeb();};header.Controls.Add(picture);}
-            var title=Style.Label("DSH 小鲸鱼",32,4,210,24,13,true,Color.Black);title.Click+=delegate{OpenWeb();};header.Controls.Add(title);
-            Controls.Add(new Panel { Bounds=new Rectangle(Style.P(14),Style.P(46),Style.P(260),1),BackColor=Color.FromArgb(225,225,225) });
-            rows=new FlowLayoutPanel { Bounds=new Rectangle(Style.P(14),Style.P(56),Style.P(260),Style.P(126)),FlowDirection=FlowDirection.TopDown,WrapContents=false,AutoScroll=true };Controls.Add(rows);
-            bottomLine=new Panel { Height=1,Left=Style.P(14),Width=Style.P(260),BackColor=Color.FromArgb(225,225,225) };Controls.Add(bottomLine);
-            toggle=ButtonAt("开启服务",14,205,126,async delegate{await Act(async()=>{if(service.Running)await service.Stop();else await service.Start(true);});});
-            restart=ButtonAt("重启服务",148,205,126,async delegate{await Act(()=>service.Restart());});
-            open=ButtonAt("启动并打开 DSH",14,233,260,async delegate{await OpenDsh();});
-            configure=ButtonAt("设置…",174,264,37,delegate{ShowSettings();});((SoftButton)configure).Link=true;configure.Font=Style.Font(10,false);
-            quit=ButtonAt("退出小鲸鱼",215,264,59,async delegate{await Quit();});((SoftButton)quit).Link=true;quit.Font=Style.Font(10,false);
-            updated=Style.Label("",14,264,150,16,10,false,Color.FromArgb(160,160,160));Controls.Add(updated);
-            whaleIcon = MakeIcon(); Icon = whaleIcon;
-            Deactivate += delegate { if (!demo && !busy) { Hide(); lastClose = DateTime.UtcNow; } };
-            FormClosing += delegate(object sender, FormClosingEventArgs e) { if (!quitting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); } };
-            if (demo) { service.Readings = DemoReadings(); service.Running = true; service.BalancesReachable = true; }
-            KeyPreview = true; KeyDown += delegate(object sender, KeyEventArgs e) { if (e.Control && e.KeyCode == Keys.Oemcomma) { ShowSettings(); e.Handled = true; } };
+            Text = "DSH 小鲸鱼"; Font = Style.Font(13, false); BackColor = Style.Back;
+            AutoScaleMode = AutoScaleMode.None; FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false; TopMost = true; StartPosition = FormStartPosition.Manual;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            // A whale-tray.custom.ico / whale-app.custom.ico beside the exe wins over the packaged icons and survives updates.
+            trayIcon = LoadIcon(SystemInformation.SmallIconSize, "whale-tray.custom.ico", "whale-tray.ico", "whale-windows.ico");
+            appIcon = LoadIcon(SystemInformation.IconSize, "whale-app.custom.ico", "whale-windows.ico");
+            Icon = appIcon;
+            glyph = LoadGlyph(Style.P(20));
+            toggle = AddButton(async delegate { await ToggleService(); });
+            restart = AddButton(async delegate { await Act("restart", () => service.Restart()); });
+            open = AddButton(async delegate { await OpenDsh(); });
+            configure = AddButton(delegate { ShowSettings(); }); configure.Text = "设置…";
+            quit = AddButton(async delegate { await Quit(); }); quit.Text = "退出小鲸鱼";
+            foreach (var link in new [] { configure, quit }) { link.Link = true; link.Align = TextFormatFlags.Right; link.Font = Style.Font(12, false); }
+            Deactivate += delegate { if (!demo && !TrayIconPressed()) HidePanel(); };
+            FormClosing += delegate(object sender, FormClosingEventArgs e) { if (!quitting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; HidePanel(); } };
+            KeyPreview = true;
+            KeyDown += delegate(object sender, KeyEventArgs e) {
+                if (e.KeyCode == Keys.Escape) { HidePanel(); e.Handled = true; }
+                else if (e.Control && e.KeyCode == Keys.Oemcomma) { ShowSettings(); e.Handled = true; }
+            };
+            if (demo) { service.Readings = DemoReadings(); service.Running = true; service.BalancesReachable = true; updatedAt = DateTime.Now; }
             Render();
         }
         // Builds before the rename kept settings under %LOCALAPPDATA%\DSHWhale-Vibe and used a
@@ -128,97 +142,213 @@ namespace DshWhale {
         public static Dictionary<string, Reading> DemoReadings() {
             return Balances.Parse("{\"ok\":true,\"providers\":{\"deepseek\":{\"ok\":true,\"label\":\"DeepSeek\",\"kind\":\"prepaid\",\"currency\":\"CNY\",\"remaining\":86.4},\"openrouter\":{\"ok\":true,\"label\":\"OpenRouter\",\"kind\":\"prepaid\",\"currency\":\"USD\",\"remaining\":12.5},\"codex\":{\"ok\":true,\"label\":\"ChatGPT 5h 余量\",\"kind\":\"quota\",\"currency\":\"%\",\"remaining\":72,\"limit\":100}}}");
         }
-        Icon MakeIcon() {
-            string appIcon = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"whale-windows.ico");
-            if(File.Exists(appIcon))return new Icon(appIcon,32,32);
-            string resource = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "whale.png");
-            if (!File.Exists(resource)) return (Icon)SystemIcons.Application.Clone();
-            using (var original = new Bitmap(resource)) using (var bitmap = new Bitmap(32, 32)) {
-                using (var g = Graphics.FromImage(bitmap)) { g.Clear(Color.FromArgb(61, 132, 246)); g.DrawImage(original, 3, 3, 26, 26); }
-                IntPtr h = bitmap.GetHicon(); try { using (var borrowed = Icon.FromHandle(h)) return (Icon)borrowed.Clone(); } finally { DestroyIcon(h); }
+        static Icon LoadIcon(Size size, params string[] names) {
+            foreach (string name in names) {
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, name);
+                if (File.Exists(path)) try { return new Icon(path, size); } catch (Exception e) { Diagnostics.Log("Icon " + name + " unreadable: " + e.Message); }
             }
+            try { return Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { return (Icon)SystemIcons.Application.Clone(); }
         }
-        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr handle);
-        Button ButtonAt(string text, int x, int y, int width, EventHandler action) {
-            var b=new SoftButton { Text=text,Bounds=new Rectangle(Style.P(x),Style.P(y),Style.P(width),Style.P(22)) };
-            b.Click+=action;Controls.Add(b);return b;
+        // The header whale, shrunk once to this screen's exact pixel size (see Style.Scaled).
+        static Bitmap LoadGlyph(int size) {
+            string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "whale.png");
+            if (!File.Exists(path)) return null;
+            try { using (var source = Image.FromFile(path)) return Style.Scaled(source, size); } catch { return null; }
         }
+        SoftButton AddButton(EventHandler action) { var b = new SoftButton(); b.Click += action; Controls.Add(b); return b; }
         protected override CreateParams CreateParams { get { var p=base.CreateParams;p.ClassStyle|=0x20000;return p;} }
-        protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); if(Width>24&&Height>24)using(var path=Style.Round(new RectangleF(0,0,Width,Height),Style.P(12))){var previous=Region;Region=new Region(path);if(previous!=null)previous.Dispose();} }
+        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Style.RoundCorners(Handle); }
         public async Task Initialize(bool showSettings, bool noStart, bool showPanel = false) {
             if (noStart) service.Stopped = true;
             if (!demo) MigrateAutostart();
-            tray = new NotifyIcon { Icon = whaleIcon, Text = "DSH 小鲸鱼", Visible = true };
-            tray.MouseClick += async delegate(object sender, MouseEventArgs e) {
+            tray = new NotifyIcon { Icon = trayIcon, Text = "DSH 小鲸鱼", Visible = true, ContextMenu = BuildMenu() };
+            tray.MouseClick += delegate(object sender, MouseEventArgs e) {
                 if (e.Button != MouseButtons.Left) return;
-                if (Visible) { Hide(); return; } if ((DateTime.UtcNow - lastClose).TotalMilliseconds < 250) return;
-                ShowPanel(); if (!demo) await Act(() => service.Tick(false));
+                if (Visible) { HidePanel(); return; }
+                // Deactivate already closed it for this very click: the taskbar took the focus on mouse down.
+                if ((DateTime.UtcNow - lastClose).TotalMilliseconds < 500) return;
+                ShowPanel(new Rectangle(Cursor.Position, new Size(1, 1)));
             };
-            var menu = new ContextMenuStrip();
-            menu.Items.Add("启动并打开 DSH", null, async delegate { await OpenDsh(); });
-            menu.Items.Add("显示面板", null, delegate { ShowPanel(); });
-            menu.Items.Add("设置…", null, delegate { ShowSettings(); });
-            menu.Items.Add("退出…", null, async delegate { await Quit(); }); tray.ContextMenuStrip = menu;
             if (startupProblem != null) Notify(startupProblem);
-            if (demo || showPanel) ShowPanel(); else Hide();
             timer = new System.Windows.Forms.Timer { Interval = 20000 };
-            timer.Tick += async delegate { if (!demo) await Act(() => service.Tick(true)); };
+            timer.Tick += delegate { BeginRefresh(true); };
             timer.Start();
+            // Keeps "N 秒前更新" current while the panel is open.
+            clock = new System.Windows.Forms.Timer { Interval = 1000 };
+            clock.Tick += delegate { if (Visible) Invalidate(FooterBounds()); };
+            clock.Start();
             if (showSettings) ShowSettings();
-            if (!demo) await Act(() => service.Tick(true));
+            if (demo || showPanel) ShowPanel();
+            if (!demo) await RefreshAll(true);
         }
-        internal void ShowPanel() {
-            Rectangle area = Screen.FromPoint(Cursor.Position).WorkingArea;
-            Location = new Point(Math.Max(area.Left, area.Right - Width - 12), Math.Max(area.Top, area.Bottom - Height - 12));
-            Render(); Show(); Activate();
+        // Native menu: Windows 11 draws it with its own rounded style.
+        ContextMenu BuildMenu() {
+            var menu = new ContextMenu();
+            openItem = new MenuItem("打开 DSH 界面", async delegate { await OpenDsh(); });
+            menu.MenuItems.Add(openItem); menu.MenuItems.Add("-");
+            menu.MenuItems.Add(new MenuItem("显示面板", delegate { ShowPanel(); }));
+            menu.MenuItems.Add(new MenuItem("设置…", delegate { ShowSettings(); }));
+            menu.MenuItems.Add("-");
+            menu.MenuItems.Add(new MenuItem("退出小鲸鱼", async delegate { await Quit(); }));
+            menu.Popup += delegate {
+                HidePanel();
+                openItem.Text = service.Running ? "打开 DSH 界面" : "启动并打开 DSH";
+            };
+            return menu;
         }
-        void AddRow(string title,string value,string health,bool emphasis) { rows.Controls.Add(new StatusLine(title,value,health,emphasis)); }
+        internal void ShowPanel() { ShowPanel(Rectangle.Empty); }
+        void ShowPanel(Rectangle click) {
+            Render();
+            Rectangle icon = TrayBounds();
+            // A click in the hidden-icons flyout is reported where it happened; the icon's own rect is elsewhere then.
+            anchor = !click.IsEmpty && (icon.IsEmpty || !Rectangle.Inflate(icon, Style.P(8), Style.P(8)).Contains(click.Location)) ? click : icon;
+            Place();
+            Show(); Activate();
+            BeginRefresh(true);
+        }
+        void Place() {
+            Screen screen = anchor.IsEmpty ? Screen.PrimaryScreen : Screen.FromRectangle(anchor);
+            Rectangle work = screen.WorkingArea;
+            // Without an icon position: the old spot, bottom right above the taskbar.
+            Rectangle at = anchor.IsEmpty ? new Rectangle(work.Right - 1, work.Bottom, 1, 1) : anchor;
+            Location = Placement.Compute(at, screen.Bounds, work, Size, Style.P(12));
+        }
+        void HidePanel() { if (!Visible) return; Hide(); lastClose = DateTime.UtcNow; }
+        // The tray icon's rect on screen. NotifyIcon keeps its window and id private; Shell_NotifyIconGetRect needs both.
+        Rectangle TrayBounds() {
+            if (tray == null) return Rectangle.Empty;
+            try {
+                var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+                var window = typeof(NotifyIcon).GetField("window", flags).GetValue(tray) as NativeWindow;
+                object id = typeof(NotifyIcon).GetField("id", flags).GetValue(tray);
+                if (window == null || !(id is int)) return Rectangle.Empty;
+                var identifier = new NotifyIconIdentifier { Size = Marshal.SizeOf(typeof(NotifyIconIdentifier)), Window = window.Handle, Id = (uint)(int)id };
+                NativeRect r;
+                if (Shell_NotifyIconGetRect(ref identifier, out r) != 0) return Rectangle.Empty;
+                var bounds = Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
+                return bounds.Width > 0 && Screen.AllScreens.Any(s => s.Bounds.IntersectsWith(bounds)) ? bounds : Rectangle.Empty;
+            } catch (Exception) { return Rectangle.Empty; }
+        }
+        // The tray icon is being clicked while the panel is open: MouseClick closes it, and closing it here
+        // as well would make that same click open it again.
+        bool TrayIconPressed() {
+            if ((GetAsyncKeyState(0x01) & 0x8000) == 0) return false;
+            Rectangle icon = TrayBounds();
+            return !icon.IsEmpty && icon.Contains(Cursor.Position);
+        }
+        string LocalStatus(bool manage) {
+            if (service.Running) return "运行中";
+            if (!manage) return service.DesktopOnly ? "桌面版管理" : "未运行";
+            return service.Stopped ? "已停止" : service.Failures >= 3 ? "启动失败" : "未运行";
+        }
         void Render() {
-            rows.SuspendLayout();foreach(Control c in rows.Controls.Cast<Control>().ToArray())c.Dispose();rows.Controls.Clear();
-            bool manage=demo||service.Manages;
-            AddRow("DSH 后台服务",service.Running?"运行中":!manage&&service.DesktopOnly?"桌面版管理":"未运行",service.Running?"green":manage?"red":"yellow",false);
-            if(settings.ShowClawbot){bool logged=demo||service.Clawbot;AddRow("微信 Clawbot",logged?"已登录":"未登录",logged?"green":"red",false);}
-            foreach(var s in Balances.Layout(settings.Sources,service.Readings).Where(x=>x.Visible)) {Reading r;service.Readings.TryGetValue(s.Id,out r);AddRow(String.IsNullOrWhiteSpace(s.Title)?r==null?s.Id:r.DefaultTitle:s.Title.Trim(),r==null?"—":r.Text,r==null?"red":r.Health,true);}
-            if(rows.Controls.Count>0) rows.Controls[rows.Controls.Count-1].Margin=Padding.Empty;
-            int rowHeight=rows.Controls.Cast<Control>().Sum(c=>c.Height+c.Margin.Vertical);
-            rows.AutoScroll=rowHeight>Style.P(330);rows.Height=Math.Min(Style.P(330),rowHeight);
-            foreach(Control row in rows.Controls)row.Width=rows.Width-(rows.AutoScroll?SystemInformation.VerticalScrollBarWidth:0);
-            rows.ResumeLayout();
-            bottomLine.Top=rows.Bottom+Style.P(11);toggle.Top=restart.Top=bottomLine.Bottom+Style.P(10);open.Top=toggle.Bottom+Style.P(7);
-            updated.Top=configure.Top=quit.Top=open.Bottom+Style.P(9);configure.Height=quit.Height=Style.P(16);ClientSize=new Size(Style.P(288),quit.Bottom+Style.P(11));
-            // Observe mode (only a DSH Desktop profile, or chosen in the options): show what answers on port 3080,
-            // never start or stop DSH. DSH Desktop's own host is on another port and is not shown.
-            toggle.Text=service.Running?"关闭服务":busy?"正在启动…":"开启服务";restart.Enabled=!busy&&service.Running&&manage;
-            toggle.Enabled=!busy&&manage;open.Enabled=!busy&&(manage||service.Running);configure.Enabled=true;
-            open.Text=busy?"正在连接 DSH…":service.Running?"打开 DSH 界面":manage?"启动并打开 DSH":service.DesktopOnly?"请打开 DSH 桌面版":"DSH 未运行";
-            ((SoftButton)toggle).Primary=!service.Running&&!busy&&manage;toggle.Invalidate();AcceptButton=service.Running||!manage?null:toggle;
-            int seconds=updatedAt==default(DateTime)?0:(int)(DateTime.Now-updatedAt).TotalSeconds;updated.Text=demo||seconds<5?"刚刚更新":seconds+" 秒前更新";
-            if(tray!=null)tray.Text="DSH 小鲸鱼 · "+(service.Running?"运行中":!manage&&service.DesktopOnly?"桌面版管理":"未运行");
-            if(settingsForm!=null&&!settingsForm.IsDisposed)settingsForm.UpdateReadings(service.Readings,service.BalancesReachable,service.BalanceProblem);
+            bool manage = demo || service.Manages;
+            var data = new List<RowData>();
+            data.Add(new RowData { Title = "DSH 后台服务", Value = LocalStatus(manage), Health = service.Running ? "green" : manage ? "red" : "yellow" });
+            if (settings.ShowClawbot) { bool logged = demo || service.Clawbot; data.Add(new RowData { Title = "微信 Clawbot", Value = logged ? "已登录" : "未登录", Health = logged ? "green" : "red" }); }
+            int hosts = data.Count;
+            var readings = service.Readings;
+            foreach (var s in Balances.Layout(settings.Sources, readings).Where(x => x.Visible)) {
+                Reading r; readings.TryGetValue(s.Id, out r);
+                data.Add(new RowData { Title = String.IsNullOrWhiteSpace(s.Title) ? (r == null ? s.Id : r.DefaultTitle) : s.Title.Trim(), Value = r == null ? "—" : r.Text, Health = r == null ? "red" : r.Health, Emphasis = true });
+            }
+            while (rows.Count < data.Count) { var line = new StatusLine(); rows.Add(line); Controls.Add(line); }
+            while (rows.Count > data.Count) { var line = rows[rows.Count - 1]; rows.RemoveAt(rows.Count - 1); Controls.Remove(line); line.Dispose(); }
+            // Same grid as before: 14 margins, two 126-wide columns 8 apart.
+            int width = Style.P(288), margin = Style.P(14), column = Style.P(126), buttonHeight = Style.P(28), rowHeight = Style.P(30);
+            header = new Rectangle(Style.P(8), Style.P(8), width - Style.P(16), Style.P(36));
+            // Rows sit inside the card's rounded corners, clear of its outline.
+            int top = header.Bottom + Style.P(6), y = top + Style.P(6);
+            separator = -1;
+            for (int i = 0; i < data.Count; i++) {
+                if (i == hosts && i > 0) { separator = y + Style.P(4); y += Style.P(9); }
+                rows[i].Set(data[i].Title, data[i].Value, data[i].Health, data[i].Emphasis);
+                rows[i].Bounds = new Rectangle(margin + Style.P(3), y, width - 2 * margin - Style.P(6), rowHeight);
+                y += rowHeight;
+            }
+            card = new Rectangle(margin, top, width - 2 * margin, y + Style.P(6) - top);
+            y = card.Bottom + Style.P(12);
+            toggle.Bounds = new Rectangle(margin, y, column, buttonHeight);
+            restart.Bounds = new Rectangle(width - margin - column, y, column, buttonHeight);
+            y += buttonHeight + Style.P(8);
+            open.Bounds = new Rectangle(margin, y, width - 2 * margin, buttonHeight);
+            y += buttonHeight + Style.P(10);
+            int linkHeight = Style.P(20), quitWidth = TextRenderer.MeasureText(quit.Text, quit.Font).Width + Style.P(6), configureWidth = TextRenderer.MeasureText(configure.Text, configure.Font).Width + Style.P(6);
+            quit.Bounds = new Rectangle(width - margin - quitWidth, y, quitWidth, linkHeight);
+            configure.Bounds = new Rectangle(quit.Left - Style.P(10) - configureWidth, y, configureWidth, linkHeight);
+            toggle.Text = busy == "toggle" ? (service.Running ? "正在停止…" : "正在启动…") : service.Running ? "关闭服务" : "开启服务";
+            toggle.Enabled = busy == null && manage;
+            toggle.Primary = busy == null && manage && !service.Running; toggle.Invalidate();
+            restart.Text = busy == "restart" ? "正在重启…" : "重启服务";
+            restart.Enabled = busy == null && manage && service.Running;
+            open.Text = busy == "open" ? "正在连接 DSH…" : service.Running ? "打开 DSH 界面" : manage ? "启动并打开 DSH" : service.DesktopOnly ? "请打开 DSH 桌面版" : "DSH 未运行";
+            open.Enabled = busy == null && (manage || service.Running);
+            var size = new Size(width, y + linkHeight + Style.P(10));
+            if (ClientSize != size) { ClientSize = size; if (Visible) Place(); }
+            if (tray != null) tray.Text = TrayText();
+            if (settingsForm != null && !settingsForm.IsDisposed) settingsForm.UpdateReadings(readings, service.BalancesReachable, service.BalanceProblem);
+            Invalidate();
         }
-        async Task Act(Func<Task> action) {
-            if (busy) return;
-            busy = true; Render();
-            try { await action(); updatedAt=DateTime.Now; }
+        string TrayText() { return "DSH 小鲸鱼 · " + (service.Running ? "运行中" : !(demo || service.Manages) && service.DesktopOnly ? "桌面版管理" : "未运行"); }
+        Rectangle FooterBounds() { return new Rectangle(Style.P(16), configure.Top, Math.Max(0, configure.Left - Style.P(24)), configure.Height); }
+        string FooterText() {
+            if (!demo && updatedAt == default(DateTime)) return "正在检查…";
+            int seconds = (int)(DateTime.Now - updatedAt).TotalSeconds;
+            return demo || seconds < 5 ? "刚刚更新" : seconds < 60 ? seconds + " 秒前更新" : seconds / 60 + " 分钟前更新";
+        }
+        protected override void OnPaint(PaintEventArgs e) {
+            var g = e.Graphics;
+            g.Clear(Style.Back); g.SmoothingMode = SmoothingMode.AntiAlias;
+            if (headerHot) using (var path = Style.Round(header, Style.P(6))) using (var b = new SolidBrush(Style.Hover)) g.FillPath(b, path);
+            int textLeft = header.Left + Style.P(8);
+            if (glyph != null) { g.DrawImageUnscaled(glyph, textLeft, header.Top + (header.Height - glyph.Height) / 2); textLeft += glyph.Width + Style.P(8); }
+            using (var f = Style.Font(14, true)) TextRenderer.DrawText(g, "DSH 小鲸鱼", f, new Rectangle(textLeft, header.Top, header.Right - textLeft, header.Height), Style.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            using (var path = Style.Round(new RectangleF(card.X + .5f, card.Y + .5f, card.Width - 1, card.Height - 1), Style.P(8))) {
+                using (var b = new SolidBrush(Style.Card)) g.FillPath(b, path);
+                using (var p = new Pen(Style.CardEdge)) g.DrawPath(p, path);
+            }
+            if (separator >= 0) using (var p = new Pen(Style.Line)) g.DrawLine(p, card.Left + Style.P(12), separator, card.Right - Style.P(12), separator);
+            using (var f = Style.Font(12, false)) TextRenderer.DrawText(g, FooterText(), f, FooterBounds(), Style.Muted, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+            // Outline for Windows 10 and screenshots; on Windows 11 it lies under the rounded border DWM draws.
+            using (var p = new Pen(Style.Edge)) {
+                if (Style.Win11) using (var path = Style.Round(new RectangleF(.5f, .5f, Width - 1, Height - 1), Style.P(8))) g.DrawPath(p, path);
+                else g.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
+            }
+        }
+        // The header opens this computer's DSH, like the Mac panel's header.
+        protected override void OnMouseMove(MouseEventArgs e) { base.OnMouseMove(e); SetHeaderHot(header.Contains(e.Location)); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); SetHeaderHot(false); }
+        protected override void OnMouseClick(MouseEventArgs e) { base.OnMouseClick(e); if (e.Button == MouseButtons.Left && header.Contains(e.Location)) { var ignored = OpenDsh(); } }
+        void SetHeaderHot(bool hot) { if (hot == headerHot) return; headerHot = hot; Invalidate(header); }
+        void BeginRefresh(bool supervise) { var ignored = RefreshAll(supervise); }
+        async Task RefreshAll(bool supervise) {
+            if (refreshing || demo) return;
+            refreshing = true;
+            try { await service.Tick(supervise); updatedAt = DateTime.Now; }
+            catch (Exception e) { Diagnostics.Log("Refresh failed: " + e.Message); }
+            finally { refreshing = false; if (!IsDisposed) Render(); }
+        }
+        async Task Act(string what, Func<Task> action) {
+            if (busy != null) return;
+            busy = what; Render();
+            try { await action(); updatedAt = DateTime.Now; }
             catch (Exception e) { Notify(Service.Redact(e.Message)); }
-            finally { busy = false; if (!IsDisposed) Render(); }
+            finally { busy = null; if (!IsDisposed) Render(); }
         }
+        // Starting only starts; the open buttons are there to open a window.
+        async Task ToggleService() { await Act("toggle", async () => { if (service.Running) await service.Stop(); else await service.Start(false); }); }
         void Notify(string text) {
             Diagnostics.Log(text);
             if (tray != null) tray.ShowBalloonTip(8000, "DSH 小鲸鱼", text.Length > 250 ? text.Substring(0, 250) : text, ToolTipIcon.Info);
         }
         void OpenWeb() {
             if (demo) return;
-            string url = service.WebUrl();
-            if (settings.AppWindow) {
-                string edge = new [] { Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Microsoft", "Edge", "Application", "msedge.exe"), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft", "Edge", "Application", "msedge.exe") }.FirstOrDefault(File.Exists);
-                if (edge != null) { Process.Start(new ProcessStartInfo(edge, "--app=" + Native.Quote(url)) { UseShellExecute = false }); return; }
-            }
-            try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); } catch (Exception e) { Notify("无法打开浏览器：" + e.Message); }
+            try { Browser.Open(service.WebUrl(), settings.AppWindow); } catch (Exception e) { Notify("无法打开浏览器：" + e.Message); }
         }
         internal void ShowSettings() {
+            HidePanel();
             if (settingsForm != null && !settingsForm.IsDisposed) { settingsForm.Show(); settingsForm.Activate(); return; }
-            Hide(); settingsForm = new SettingsForm(settings, service.Readings, demo);
+            settingsForm = new SettingsForm(settings, service.Readings, demo) { Icon = appIcon };
             settingsForm.UpdateReadings(service.Readings, service.BalancesReachable, service.BalanceProblem);
             settingsForm.Saved += delegate(Settings s) {
                 if (!demo) s.Save(settingsPath);
@@ -228,22 +358,26 @@ namespace DshWhale {
         }
         internal async Task OpenDsh() {
             if(demo)return;
-            while(busy&&!IsDisposed)await Task.Delay(100);
-            if(!IsDisposed)await Act(()=>service.Start(true));
+            // Already listening: open at once. Only a stopped DSH takes the start path, whose refresh waits on the balance lookups.
+            bool up; try { up = Native.Listeners(service.Port).Count > 0; } catch (Exception) { up = false; }
+            if (up) { OpenWeb(); HidePanel(); return; }
+            while(busy!=null&&!IsDisposed)await Task.Delay(100);
+            if(!IsDisposed)await Act("open", ()=>service.Start(true));
         }
         async Task Quit() {
-            if (busy) { Notify("服务操作正在进行，请稍后退出。"); return; }
-            // In observe mode the tray never stops DSH, so there is nothing to ask.
-            var result = !demo && !service.Manages ? DialogResult.No : MessageBox.Show("是否同时停止 DSH 服务？\n\n是：退出并停止服务\n否：退出但保留服务\n取消：继续运行小鲸鱼", "退出小鲸鱼", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-            if (result == DialogResult.Cancel) return;
-            if (result == DialogResult.Yes && !demo) {
-                busy = true; try { await service.Stop(); } catch (Exception e) { MessageBox.Show(e.Message, "停止失败，未退出"); return; } finally { busy = false; }
+            if (busy != null) { Notify("服务操作正在进行，请稍后退出。"); return; }
+            HidePanel();
+            // Nothing to ask when the tray only watches DSH or it is not running.
+            QuitChoice choice = demo || (service.Manages && service.Running) ? QuitPrompt.Ask(appIcon) : QuitChoice.KeepService;
+            if (choice == QuitChoice.Cancel) return;
+            if (choice == QuitChoice.StopService && !demo) {
+                busy = "quit"; try { await service.Stop(); } catch (Exception e) { MessageBox.Show(e.Message, "停止失败，未退出"); return; } finally { busy = null; }
             }
-            quitting = true; if (timer != null) timer.Stop(); if (tray != null) tray.Visible = false; Application.Exit();
+            quitting = true; if (timer != null) timer.Stop(); if (clock != null) clock.Stop(); if (tray != null) tray.Visible = false; Application.Exit();
         }
         public void Snapshot(string directory) {
             Directory.CreateDirectory(directory);
-            StartPosition=FormStartPosition.Manual;Location=new Point(-20000,-20000);Show(); PerformLayout(); Application.DoEvents();
+            Location=new Point(-20000,-20000);Show(); PerformLayout(); Application.DoEvents();
             using (var bitmap = new Bitmap(Width, Height)) { DrawToBitmap(bitmap, new Rectangle(0, 0, Width, Height)); bitmap.Save(Path.Combine(directory, "panel.png")); }
             using (var f = new SettingsForm(settings, service.Readings, true)) {
                 f.StartPosition=FormStartPosition.Manual;f.Location=new Point(-20000,-20000);f.Show(); f.PerformLayout(); Application.DoEvents();
@@ -252,8 +386,9 @@ namespace DshWhale {
             Hide();
         }
         protected override void Dispose(bool disposing) {
-            if (disposing) { if (timer != null) timer.Dispose(); if (tray != null) tray.Dispose(); if (settingsForm != null) settingsForm.Dispose(); service.Dispose(); if (whaleIcon != null) whaleIcon.Dispose(); }
+            if (disposing) { if (timer != null) timer.Dispose(); if (clock != null) clock.Dispose(); if (tray != null) tray.Dispose(); if (settingsForm != null) settingsForm.Dispose(); service.Dispose(); if (glyph != null) glyph.Dispose(); }
             base.Dispose(disposing);
+            if (disposing) { if (trayIcon != null) trayIcon.Dispose(); if (appIcon != null) appIcon.Dispose(); }
         }
     }
 }

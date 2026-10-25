@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -25,6 +26,7 @@ namespace DshWhale {
         public static readonly string SettingsEvent = "Local\\DSHWhale.Settings." + Environment.UserName;
         public static readonly string OpenEvent = "Local\\DSHWhale.Open." + Environment.UserName;
         public static readonly string PanelEvent = "Local\\DSHWhale.Panel." + Environment.UserName;
+        [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int processId);
         // A plain launch (double-click) shows the panel; the login entry passes --autostart and stays in the tray.
         static bool WantsPanel(string[] args) {
             return args.Contains("--panel") || !(args.Contains("--autostart") || args.Contains("--open") || args.Contains("--settings") || args.Contains("--no-start"));
@@ -42,6 +44,8 @@ namespace DshWhale {
             bool created; bool panel = WantsPanel(args);
             using (var mutex = new Mutex(true, "Local\\DSHWhale.Supervisor." + Environment.UserName, out created)) {
                 if (!created) {
+                    // This launch got the foreground from the user's click; hand it on, or the running tray's panel opens behind other windows.
+                    AllowSetForegroundWindow(-1);
                     if (args.Contains("--open")) Forward(OpenEvent); else if (panel) Forward(PanelEvent);
                     if (args.Contains("--settings")) Forward(SettingsEvent);
                     return 0;

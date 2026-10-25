@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Tasks;
@@ -26,11 +27,22 @@ class Tests {
         var layout = Balances.Layout(saved, data);
         Check(layout[0].Id == "missing" && layout.Skip(1).All(x => !x.Visible), "saved ordering retained and new providers hidden");
         Check(Balances.Layout(null, data).All(x => x.Visible), "first-run providers visible");
+        // Panel placement on a 3840x2160 screen; the panel is 576x700 and keeps 24 px from every edge.
+        var screen = new Rectangle(0, 0, 3840, 2160); var panel = new Size(576, 700);
+        var bottomBar = new Rectangle(0, 0, 3840, 2064);
+        Check(Placement.Compute(new Rectangle(3200, 2080, 32, 32), screen, bottomBar, panel, 24) == new Point(3216 - 288, 2064 - 24 - 700), "panel opens above the taskbar, centred on the tray icon");
+        Check(Placement.Compute(new Rectangle(3790, 2080, 32, 32), screen, bottomBar, panel, 24).X == 3840 - 24 - 576, "panel stays on screen when the icon is at the edge");
+        Check(Placement.Compute(new Rectangle(3200, 10, 32, 32), screen, new Rectangle(0, 96, 3840, 2064), panel, 24).Y == 96 + 24, "top taskbar puts the panel below it");
+        Check(Placement.Compute(new Rectangle(10, 1000, 32, 32), screen, new Rectangle(96, 0, 3744, 2160), panel, 24).X == 96 + 24, "left taskbar puts the panel beside it");
+        Check(Placement.Compute(new Rectangle(3200, 2140, 32, 20), screen, screen, panel, 24).Y == 2140 - 24 - 700, "auto-hidden taskbar: the panel opens above the icon");
         string directory = Path.Combine(root, "build", "test-data-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(directory);
         string fixture = Path.Combine(directory, "fixture with spaces.js"); File.Copy(Path.Combine(root, "tests", "fake-dsh.js"), fixture);
         var settings = new Settings { NodePath = Discovery.FindExe("node.exe"), DshPath = fixture, Sources = saved };
         settings.Save(Path.Combine(directory, "settings.json"));
         Check(Settings.Load(Path.Combine(directory, "settings.json")).Sources[0].Title == "自定义", "settings UTF-8 roundtrip");
+        File.WriteAllText(Path.Combine(directory, "old-settings.json"), "{\"ShowClawbot\":false}");
+        var older = Settings.Load(Path.Combine(directory, "old-settings.json"));
+        Check(!older.ShowClawbot && older.HostMode == "auto", "settings from an older build get defaults for what they lack");
         int port = FreePort(); File.WriteAllText(Path.Combine(directory, "port.txt"), port.ToString());
         var service = new Service(settings, directory, port);
         try {

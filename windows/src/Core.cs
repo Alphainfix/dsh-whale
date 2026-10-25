@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -13,6 +14,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
+using Microsoft.Win32;
 
 namespace DshWhale {
     public class SourceSetting {
@@ -87,6 +89,64 @@ namespace DshWhale {
             string[] preferred = { "deepseek", "openrouter", "codex" };
             foreach (string id in available.Keys.Where(x => !result.Any(s => s.Id == x)).OrderBy(x => Array.IndexOf(preferred, x) < 0 ? 99 : Array.IndexOf(preferred, x)).ThenBy(x => x, StringComparer.Ordinal)) result.Add(new SourceSetting { Id = id, Title = "", Visible = saved == null });
             return result;
+        }
+    }
+    public static class Browser {
+        static string Registered(string exe) {
+            foreach (RegistryKey root in new [] { Registry.CurrentUser, Registry.LocalMachine }) {
+                try {
+                    using (var key = root.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\App Paths\" + exe)) {
+                        string path = key == null ? null : (key.GetValue(null) as string ?? "").Trim('"');
+                        if (!String.IsNullOrEmpty(path) && File.Exists(path)) return path;
+                    }
+                } catch { }
+            }
+            return null;
+        }
+        static string Installed(string exe, string[] parts, Environment.SpecialFolder[] roots) {
+            string found = Registered(exe);
+            if (found != null) return found;
+            foreach (var root in roots) { string p = Path.Combine(Environment.GetFolderPath(root), Path.Combine(parts), exe); if (File.Exists(p)) return p; }
+            return null;
+        }
+        public static string Chrome() { return Installed("chrome.exe", new [] { "Google", "Chrome", "Application" }, new [] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86, Environment.SpecialFolder.LocalApplicationData }); }
+        public static string Edge() { return Installed("msedge.exe", new [] { "Microsoft", "Edge", "Application" }, new [] { Environment.SpecialFolder.ProgramFilesX86, Environment.SpecialFolder.ProgramFiles }); }
+        // appWindow: a window of its own like an installed web app (Chrome, else Edge); otherwise the default browser.
+        public static void Open(string url, bool appWindow) {
+            string browser = appWindow ? Chrome() ?? Edge() : null;
+            if (browser != null) Process.Start(new ProcessStartInfo(browser, "--app=" + Native.Quote(url)) { UseShellExecute = false });
+            else Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+    }
+    // Where the panel opens: against the taskbar, centred on the tray icon, `gap` inside the work area.
+    public static class Placement {
+        public static Point Compute(Rectangle anchor, Rectangle screen, Rectangle work, Size panel, int gap) {
+            int x, y;
+            string edge = Edge(anchor, screen, work);
+            if (edge == "left" || edge == "right") {
+                y = anchor.Top + anchor.Height / 2 - panel.Height / 2;
+                x = edge == "left" ? Math.Max(work.Left, anchor.Right) + gap : Math.Min(work.Right, anchor.Left) - gap - panel.Width;
+            } else {
+                x = anchor.Left + anchor.Width / 2 - panel.Width / 2;
+                y = edge == "top" ? Math.Max(work.Top, anchor.Bottom) + gap : Math.Min(work.Bottom, anchor.Top) - gap - panel.Height;
+            }
+            x = Math.Max(work.Left + gap, Math.Min(x, work.Right - gap - panel.Width));
+            y = Math.Max(work.Top + gap, Math.Min(y, work.Bottom - gap - panel.Height));
+            return new Point(x, y);
+        }
+        // The taskbar's side is where the work area stops short of the screen; with an auto-hiding
+        // taskbar it is the screen edge nearest the icon.
+        public static string Edge(Rectangle anchor, Rectangle screen, Rectangle work) {
+            if (work.Bottom < screen.Bottom) return "bottom";
+            if (work.Top > screen.Top) return "top";
+            if (work.Left > screen.Left) return "left";
+            if (work.Right < screen.Right) return "right";
+            int cx = anchor.Left + anchor.Width / 2, cy = anchor.Top + anchor.Height / 2;
+            int[] distance = { screen.Bottom - cy, cy - screen.Top, cx - screen.Left, screen.Right - cx };
+            string[] names = { "bottom", "top", "left", "right" };
+            int best = 0;
+            for (int i = 1; i < distance.Length; i++) if (distance[i] < distance[best]) best = i;
+            return names[best];
         }
     }
     public class LaunchSpec { public string Node, Entry; }
